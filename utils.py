@@ -8,7 +8,6 @@ with open('config/mongo_conn.json') as f_read:
     MONGO_SERVER = conn_vars["MONGO_SERVER"]
     DATABASE = conn_vars["DATABASE"]
     character_collection = conn_vars["character_colletion"]
-    endgame_collection = conn_vars["endgame_collection"]
     endgame_metadata = conn_vars["endgame_metadata"]
 
 with open('config/client_params.json') as f_read:
@@ -28,15 +27,9 @@ zone_query = '''{
 def create_lodestone_collection(top_index: int = 20_000_001) -> None:
     mongo_client = MongoClient(MONGO_SERVER)
     db = mongo_client[DATABASE]
-    indexes = [{"_id": i, "scrapped_date": None} for i in range(1, top_index)]
+    indexes = [{"_id": i, "scrapped_lodestone_date": None,
+                "scrapped_fflogs_date": None} for i in range(1, top_index)]
     db[character_collection].insert_many(indexes)
-
-
-def create_fflogs_collection(top_index: int = 20_000_001) -> None:
-    mongo_client = MongoClient(MONGO_SERVER)
-    db = mongo_client[DATABASE]
-    indexes = [{"_id": i, "scrapped_date": None} for i in range(1, top_index)]
-    db[endgame_collection].insert_many(indexes)
 
 
 def create_metadata_collections():
@@ -69,8 +62,8 @@ def create_metadata_collections():
         tmp[expac_id] = {'name': expac_name, 'zones': zone_rework}
 
     adapted_api_data = {'worldData': {'expansions': tmp}}
+    # TODO: get datacenter, their worlds and their slug names
 
-    # insert into the metadata collection the information
     db['metadata'].insert_many([adapted_api_data, {'fights': fights},
                                 {'difficulties': difficulties}, {'expansion': expansion},
                                 {'raids': raid_zones}])
@@ -99,9 +92,7 @@ def __main__():
     print('getting metadata')
     create_metadata_collections()
     print('creating lodestone collection')
-    create_lodestone_collection(1500)
-    print('creating fflogs collection')
-    create_fflogs_collection(1500)
+    create_lodestone_collection(5000)
 
 
 if __name__ == '__main__':

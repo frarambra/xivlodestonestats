@@ -9,10 +9,14 @@ from bs4 import BeautifulSoup
 from pymongo import MongoClient, UpdateOne
 from pprint import pprint
 
+character_index_api = 'http://127.0.0.1:8000/scraping/lodestone/{}'
+fflogs_index_api = 'http://127.0.0.1:8000/fflogs/{}'
+
 
 # TODO: rewrite update part for mongo
 class Client:
-    def __init__(self, chunk_len=13):
+    def __init__(self, chunk_len=13, testing=False):
+        self.testing = testing
         self.mongo_client = MongoClient(utils.MONGO_SERVER)
         self.db = self.mongo_client[utils.DATABASE]
         self.raids = self.db[utils.endgame_metadata].find_one({"raids": {"$exists": True}})['raids']
@@ -26,33 +30,26 @@ class Client:
         self.tokes_ttl = tmp['expires_in']
 
     async def main_process(self):
-        reader, writer = await asyncio.open_connection(
-            '127.0.0.1', 8888)
-        print('client: connection opened')
-        await asyncio.sleep(3)
         async with aiohttp.ClientSession() as session:
-            try:
-                while True:
-                    # do not ask for more indexes if there's already a lot to request again
-                    if len(self.err_list) <= self.chunk_len:
-                        request = json.dumps({"request_type": "req_lode_index", "chunk_len": self.chunk_len})
-                        writer.write(f'{request}\n'.encode())
-                        raw_data = await reader.readline()
-                        message = json.loads(raw_data.decode())
-                        indexes_to_scrap = message["indexes"] if not self.err_list else self.err_list+message["indexes"]
-                    else:
-                        indexes_to_scrap = self.err_list
-                    for tmp in utils.split(indexes_to_scrap, self.chunk_len):
-                        await asyncio.gather(*[asyncio.create_task(self.scrap_character(session, _))
-                                               for _ in tmp])
+            while True:
+                if len(self.err_list) <= self.chunk_len:
+                    async with session.get(character_index_api.format(self.chunk_len)) as response:
+                        data = await response.json()
+                        indexes_to_scrap = data['lodestone_indexes'] if not self.err_list else \
+                            self.err_list + data['lodestone_indexes']
+                else:
+                    indexes_to_scrap = self.err_list
 
-                    self.db['lodestone'].bulk_write(self.update_op_list)
-                    self.update_op_list = []
-            except:
-                print(traceback.print_exc())
-            finally:
-                writer.close()
-                await writer.wait_closed()
+                for tmp in utils.split(indexes_to_scrap, self.chunk_len):
+                    await asyncio.gather(*[asyncio.create_task(self.scrap_character(session, _))
+                                           for _ in tmp])
+
+                # TODO: Add fflogs logic here
+
+                self.db[utils.character_collection].bulk_write(self.update_op_list)
+                self.update_op_list = []
+                if self.testing:
+                    break
 
     async def scrap_character(self, session, character_id=None):
         character_info = {'_id': character_id}  # 'last_checked': datetime.datetime.now()}
@@ -61,7 +58,7 @@ class Client:
             if response.status == 200:
                 character_page = await response.text()
                 character_info = {**character_info, **self.get_character_info(character_page),
-                                  'exists': 'S', 'scrapped_date': datetime.datetime.now()}
+                                  'exists': 'S', 'scrapped_lodestone_date': datetime.datetime.now()}
             elif response.status == 404:
                 character_info['exists'] = 'N'
             # Lodestone returns 429 if there's too many request from a single endpoint
@@ -93,6 +90,7 @@ class Client:
         a_tag = soup.find('div', class_='character__freecompany__name').find('a')
         # -2 due to the / at the end of the url
         tmp['fc_id'] = a_tag.get('href').split('/')[-2] if a_tag else None
+        # TODO: Normalize classes/jobs names
         tmp['jobs'] = {
             li.img.get('data-tooltip').replace(' (Limited Job)', '').split(' / ')[0]:
                 0 if li.text == '-' else int(li.text)
@@ -119,3 +117,9 @@ class Client:
                           "raids": {**{key.replace('e_', ''): value
                                        for key, value in response_data.items() if 'e_' in key}}}
             pprint(clean_data)
+
+
+# a quick test
+if __name__ == '__main__':
+    scraper = Client(1, testing=True)
+    asyncio.run(scraper.main_process())
