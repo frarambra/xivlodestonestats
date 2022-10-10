@@ -6,6 +6,5 @@
 # Datasource local storage ignored files
 /dataSources/
 /dataSources.local.xml
-/config/
-.idea/
-test_main.http
+/config/client_params.json
+/config/mongo_conn.json
