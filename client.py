@@ -10,7 +10,7 @@ from pymongo import MongoClient, UpdateOne
 from pprint import pprint
 
 character_index_api = 'http://127.0.0.1:8000/scraping/lodestone/{}'
-fflogs_index_api = 'http://127.0.0.1:8000/fflogs/{}'
+fflogs_index_api = 'http://127.0.0.1:8000/scraping/fflogs/{}'
 
 
 # TODO: rewrite update part for mongo
@@ -20,11 +20,25 @@ class Client:
         self.mongo_client = MongoClient(utils.MONGO_SERVER)
         self.db = self.mongo_client[utils.DATABASE]
         self.raids = self.db[utils.endgame_metadata].find_one({"raids": {"$exists": True}})['raids']
+        m_filter = {
+            '$and': [{'regions': {'$exists': True}},
+                     {'slug': {'$in': ['NA', 'EU', 'JP', 'OC']}}]
+        }
+        self.worlds = self.db[utils.endgame_metadata].find_one({'regions': {'$exists': True}})['regions']
+        self.worlds = {key: value for key, value in self.worlds.items() if value['slug'] in ['EU', 'NA', 'JP', 'OC']}
+        normalization = {}
+        self.regions = {}
+        for key, tmp in self.worlds.items():
+            slug = tmp['slug']
+            for _, item in tmp['servers'].items():
+                normalization[item['name']] = item['slug']
+                self.regions[item['slug']] = slug
+        self.worlds = normalization
         self.chunk_len = chunk_len
         self.err_list = []
         self.err_lock = asyncio.Lock()
         self.update_op_list = []
-        self.chara_lock = asyncio.Lock()
+        self.lock = asyncio.Lock()
         tmp = utils.get_fflogs_token()
         self.fflogs_token = tmp['access_token']
         self.tokes_ttl = tmp['expires_in']
@@ -39,19 +53,28 @@ class Client:
                             self.err_list + data['lodestone_indexes']
                 else:
                     indexes_to_scrap = self.err_list
-
+                tasks = []
                 for tmp in utils.split(indexes_to_scrap, self.chunk_len):
-                    await asyncio.gather(*[asyncio.create_task(self.scrap_character(session, _))
-                                           for _ in tmp])
+                    tasks = [asyncio.create_task(self.scrap_character(session, _)) for _ in tmp]
 
-                # TODO: Add fflogs logic here
+                # TODO: Add logic to not make more request to fflogs api until we have more cuota
+                async with session.get(fflogs_index_api.format(self.chunk_len)) as response:
+                    data = await response.json()
+                    tasks += [asyncio.create_task(self.get_fflogs_info(session=session, fflogs_id=_))
+                              for _ in data['fflogs_id']]
+                    tasks += [asyncio.create_task(self.get_fflogs_info(session=session, character_data=_))
+                              for _ in data['character_data']]
 
+                # execute the tasks
+                print(f'executing tasks {len(tasks)}')
+                await asyncio.gather(*tasks)
                 self.db[utils.character_collection].bulk_write(self.update_op_list)
                 self.update_op_list = []
                 if self.testing:
                     break
 
     async def scrap_character(self, session, character_id=None):
+        print(f'scraping {character_id}')
         character_info = {'_id': character_id}  # 'last_checked': datetime.datetime.now()}
         url = f'https://eu.finalfantasyxiv.com/lodestone/character/{character_id}/'
         async with session.get(url) as response:
@@ -71,12 +94,10 @@ class Client:
                 character_info['webpage'] = await response.text()
                 print(f'There was an error with character {character_id}')
 
-        async with self.chara_lock:
-            operation = UpdateOne({"_id": character_info["_id"]}, {"$set": character_info}, upsert=True)
-            self.update_op_list.append(operation)
+        async with self.lock:
+            self.update_op_list.append(UpdateOne({"_id": character_info["_id"]}, {"$set": character_info}, upsert=True))
 
-    @staticmethod
-    def get_character_info(character_page: str) -> dict:
+    def get_character_info(self, character_page: str) -> dict:
         tmp = {}
         soup = BeautifulSoup(character_page, 'html.parser')
         tmp['name'] = soup.find('p', class_='frame__chara__name').text
@@ -84,12 +105,18 @@ class Client:
         if title_tag:
             tmp['title'] = soup.find('p', class_='frame__chara__title').text
         world_dc = soup.find('p', class_='frame__chara__world').text
-        tmp['world'], tmp['datacenter'] = world_dc.split(' ')
+        tmp['server'], tmp['datacenter'] = world_dc.split(' ')
         tmp['datacenter'] = tmp['datacenter'].replace('[', '').replace(']', '')
+        tmp['server'] = self.worlds[tmp['server']]
+        tmp['region'] = self.regions[tmp['server']]
         # Not all characters are in a free company
-        a_tag = soup.find('div', class_='character__freecompany__name').find('a')
-        # -2 due to the / at the end of the url
-        tmp['fc_id'] = a_tag.get('href').split('/')[-2] if a_tag else None
+        try:
+            a_tag = soup.find('div', class_='character__freecompany__name').find('a')
+            # -2 due to the / at the end of the url
+            tmp['fc_id'] = a_tag.get('href').split('/')[-2]
+        except AttributeError:
+            tmp['fc_id'] = None
+
         # TODO: Normalize classes/jobs names
         tmp['jobs'] = {
             li.img.get('data-tooltip').replace(' (Limited Job)', '').split(' / ')[0]:
@@ -111,15 +138,22 @@ class Client:
 
         async with session.post(utils.fflogs_vars['api_url'], headers=headers, json=payload) as response:
             response_data = await response.json()
-            response_data = response_data["data"]["characterData"]["character"]
-            clean_data = {"name": response_data["name"], "_id": response_data["lodestoneID"],
-                          "hidden": response_data["hidden"], "fflogs_id": response_data["id"],
-                          "raids": {**{key.replace('e_', ''): value
-                                       for key, value in response_data.items() if 'e_' in key}}}
-            pprint(clean_data)
+            # fflogs api only gives status of the request when the query is badly made or
+            # there isn't enough points on the api key
+            if 'status' not in response_data.keys():
+                response_data = response_data["data"]["characterData"]["character"]
+                clean_data = {"_id": response_data["lodestoneID"], "hidden": response_data["hidden"],
+                              "fflogs_id": response_data["id"],
+                              "raids": {**{key.replace('e_', ''): value
+                                           for key, value in response_data.items() if 'e_' in key}}
+                              }
+                async with self.lock:
+                    self.update_op_list.append(UpdateOne({"_id": clean_data["_id"]}, {"$set": clean_data}, upsert=True))
+            elif response_data['status'] == 429:
+                pass
 
 
 # a quick test
 if __name__ == '__main__':
-    scraper = Client(1, testing=True)
+    scraper = Client(3, testing=False)
     asyncio.run(scraper.main_process())

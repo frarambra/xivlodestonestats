@@ -1,5 +1,4 @@
 from pymongo import MongoClient
-import time
 import json
 import requests
 
@@ -18,6 +17,15 @@ zone_query = '''{
         expansions{
             id, name,
             zones{id, name, difficulties{id, name}, encounters{id, name}}
+        }
+    }
+}
+'''
+
+world_query = '''{
+    worldData {
+        regions {id, name, slug,
+            servers(limit: 100, page: 1){ data{ id, name, slug, subregion{name}}}
         }
     }
 }
@@ -62,11 +70,22 @@ def create_metadata_collections():
         tmp[expac_id] = {'name': expac_name, 'zones': zone_rework}
 
     adapted_api_data = {'worldData': {'expansions': tmp}}
-    # TODO: get datacenter, their worlds and their slug names
+
+    fflogs_res = requests.post(fflogs_vars['api_url'], headers=headers, json={'query': world_query})
+    api_data = fflogs_res.json()
+    region_data = api_data['data']['worldData']['regions']
+    # pprint(region_data)
+    datacenters = {}
+    for item in api_data['data']['worldData']['regions']:
+        region_servers = {
+            str(server['id']): {'name': server['name'], 'slug': server['slug'], 'datacenter': server['subregion']['name']}
+            for server in item['servers']['data']
+        }
+        datacenters[str(item['id'])] = {'name': item['name'], 'slug': item['slug'], 'servers': region_servers}
 
     db['metadata'].insert_many([adapted_api_data, {'fights': fights},
                                 {'difficulties': difficulties}, {'expansion': expansion},
-                                {'raids': raid_zones}])
+                                {'raids': raid_zones}, {'regions': datacenters}])
 
 
 def delete_db():
@@ -92,7 +111,7 @@ def __main__():
     print('getting metadata')
     create_metadata_collections()
     print('creating lodestone collection')
-    create_lodestone_collection(5000)
+    create_lodestone_collection(100)
 
 
 if __name__ == '__main__':

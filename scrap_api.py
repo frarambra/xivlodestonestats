@@ -14,13 +14,21 @@ db = mongo_client[DATABASE]
 @app.get("/scraping/lodestone/{n_indexes}")
 async def lodestone(n_indexes: int):
     """Returns the amount request of lodestone id to scrap"""
-    m_filter = {"$or": [
-        {"scrapped_lodestone_date": None},
-        {"scrapped_lodestone_date": {"$lt": datetime.datetime.now() - datetime.timedelta(days=3)}}]
+
+    m_filter = {
+        "$and": [
+            {"$or": [{"exists": "S"}, {"exists": None}]},
+            {
+                "$or": [{"scrapped_lodestone_date": None},
+                        {"scrapped_lodestone_date": {"$lt": datetime.datetime.now() - datetime.timedelta(days=3)}}
+                ]
+            }
+        ]
     }
-    max_indexes = db[character_collection].count_documents(m_filter)
-    cursor = db[character_collection].find(m_filter, ['_id'])
-    indexes = [cursor.next()['_id'] for _ in range(0, min(n_indexes, max_indexes))]
+    cursor = db[character_collection].find(m_filter, ['_id'], limit=n_indexes)
+    indexes = [item['_id'] for item in cursor]
+    print(f'sending: {indexes}')
+
     return {'lodestone_indexes': indexes}
 
 
@@ -31,22 +39,23 @@ async def fflogs(n_indexes: int):
         It can return the fflogs_id or the character name with its server
         if it wasn't matched the lodestone_id to the fflogs_id yet.
     """
-    m_filter = {"$or": [
-        {"scrapped_fflogs_date": None},
-        {"scrapped_fflogs_date": {"$lt": datetime.datetime.now() - datetime.timedelta(days=3)}}]
+    m_filter = {"$and": [
+        {"exists": "S"},
+        {"$or": [
+            {"scrapped_fflogs_date": None},
+            {"scrapped_fflogs_date": {"$lt": datetime.datetime.now() - datetime.timedelta(days=3)}}]}
+        ]
     }
-    max_indexes = db[character_collection].count_documents(m_filter)
-    cursor = db[character_collection].find(m_filter, ['_id', 'fflogs_id', 'name', 'server', 'region'])
+
+    cursor = db[character_collection].find(m_filter, ['_id', 'fflogs_id', 'name', 'server', 'region'], limit=n_indexes)
 
     response = {'fflogs_id': [], 'character_data': []}
-    for _ in range(0, min(n_indexes, max_indexes)):
-        item = cursor.next()
+    for item in cursor:
         item_keys = item.keys()
         if 'fflogs_id' in item_keys:
             response['fflogs_id'].append(item['fflogs_id'])
         elif 'name' in item_keys and 'server' in item_keys and 'region' in item_keys:
             tmp = {'name': item['name'], 'server': item['server'], 'region': item['region']}
             response['character_data'].append(tmp)
-
     return response
 
