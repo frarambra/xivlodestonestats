@@ -14,7 +14,6 @@ db = mongo_client[DATABASE]
 @app.get("/scraping/lodestone/{n_indexes}")
 async def lodestone(n_indexes: int):
     """Returns the amount request of lodestone id to scrap"""
-
     m_filter = {
         "$and": [
             {"$or": [{"exists": "S"}, {"exists": None}]},
@@ -27,6 +26,13 @@ async def lodestone(n_indexes: int):
     }
     cursor = db[character_collection].find(m_filter, ['_id'], limit=n_indexes)
     indexes = [item['_id'] for item in cursor]
+    if not indexes:
+        # we had 1000 more indexes to scrap
+        max_index = db[character_collection].find_one({}, ['_id'], sort=[("_id", -1)])['_id']
+        indexes = [{"_id": i, "scrapped_lodestone_date": None,
+                    "scrapped_fflogs_date": None} for i in range(max_index+1, max_index+1001)]
+        db[character_collection].insert_many(indexes)
+        indexes = [_['_id'] for _ in indexes][:n_indexes]
     print(f'sending: {indexes}')
 
     return {'lodestone_indexes': indexes}

@@ -1,9 +1,9 @@
 import asyncio
 import aiohttp
 import datetime
-import json
 import traceback
 import utils
+import sys
 
 from bs4 import BeautifulSoup
 from pymongo import MongoClient, UpdateOne
@@ -13,7 +13,6 @@ character_index_api = 'http://127.0.0.1:8000/scraping/lodestone/{}'
 fflogs_index_api = 'http://127.0.0.1:8000/scraping/fflogs/{}'
 
 
-# TODO: rewrite update part for mongo
 class Client:
     def __init__(self, chunk_len=13, testing=False):
         self.testing = testing
@@ -40,38 +39,56 @@ class Client:
         self.update_op_list = []
         self.lock = asyncio.Lock()
         tmp = utils.get_fflogs_token()
+        self.token_points = True
         self.fflogs_token = tmp['access_token']
-        self.tokes_ttl = tmp['expires_in']
+        self.time_to_new_token = datetime.datetime.now()+datetime.timedelta(seconds=tmp['expires_in'])
 
     async def main_process(self):
-        async with aiohttp.ClientSession() as session:
+        lodestone_session = aiohttp.ClientSession()
+        fflogs_session = aiohttp.ClientSession()
+        api_session = aiohttp.ClientSession()
+        try:
             while True:
+                # prepare the tasks
                 if len(self.err_list) <= self.chunk_len:
-                    async with session.get(character_index_api.format(self.chunk_len)) as response:
+                    async with api_session.get(character_index_api.format(self.chunk_len)) as response:
                         data = await response.json()
                         indexes_to_scrap = data['lodestone_indexes'] if not self.err_list else \
                             self.err_list + data['lodestone_indexes']
                 else:
                     indexes_to_scrap = self.err_list
+                print(f'characters to scrap: {indexes_to_scrap}')
                 tasks = []
                 for tmp in utils.split(indexes_to_scrap, self.chunk_len):
-                    tasks = [asyncio.create_task(self.scrap_character(session, _)) for _ in tmp]
+                    tasks = [asyncio.create_task(self.scrap_character(lodestone_session, _)) for _ in tmp]
 
-                # TODO: Add logic to not make more request to fflogs api until we have more cuota
-                async with session.get(fflogs_index_api.format(self.chunk_len)) as response:
-                    data = await response.json()
-                    tasks += [asyncio.create_task(self.get_fflogs_info(session=session, fflogs_id=_))
-                              for _ in data['fflogs_id']]
-                    tasks += [asyncio.create_task(self.get_fflogs_info(session=session, character_data=_))
-                              for _ in data['character_data']]
-
+                if self.token_points:
+                    async with fflogs_session.get(fflogs_index_api.format(self.chunk_len)) as response:
+                        data = await response.json()
+                        tasks += [asyncio.create_task(self.get_fflogs_info(session=fflogs_session, fflogs_id=_))
+                                  for _ in data['fflogs_id']]
+                        tasks += [asyncio.create_task(self.get_fflogs_info(session=fflogs_session, character_data=_))
+                                  for _ in data['character_data']]
                 # execute the tasks
-                print(f'executing tasks {len(tasks)}')
                 await asyncio.gather(*tasks)
-                self.db[utils.character_collection].bulk_write(self.update_op_list)
-                self.update_op_list = []
+                # update info on mongo
+                if self.update_op_list:
+                    self.db[utils.character_collection].bulk_write(self.update_op_list)
+                    self.update_op_list = []
+                # get new token if needed
+                if self.time_to_new_token < datetime.datetime.now():
+                    tmp = utils.get_fflogs_token()
+                    self.token_points = True
+                    self.fflogs_token = tmp['access_token']
+                    self.time_to_new_token = datetime.datetime.now() + datetime.timedelta(seconds=tmp['expires_in'])
+
                 if self.testing:
                     break
+        except Exception as e:
+            print(traceback.format_exc(), file=sys.stderr)
+            await lodestone_session.close()
+            await fflogs_session.close()
+            await api_session.close()
 
     async def scrap_character(self, session, character_id=None):
         print(f'scraping {character_id}')
@@ -127,6 +144,7 @@ class Client:
         return tmp
 
     async def get_fflogs_info(self, session: aiohttp.ClientSession, fflogs_id=None, character_data=None):
+        # todo: rewrite the query since it's very costly, approach to frozen logs
         character_filter = f'id: {fflogs_id}' if fflogs_id else \
             f'name: "{character_data["name"]}" serverSlug: "{character_data["server"]}" ' +\
             f'serverRegion: "{character_data["region"]}"'
@@ -150,10 +168,12 @@ class Client:
                 async with self.lock:
                     self.update_op_list.append(UpdateOne({"_id": clean_data["_id"]}, {"$set": clean_data}, upsert=True))
             elif response_data['status'] == 429:
-                pass
+                print('ran out of points')
+                async with self.err_lock:
+                    self.token_points = False
 
 
 # a quick test
 if __name__ == '__main__':
-    scraper = Client(3, testing=False)
+    scraper = Client(chunk_len=3, testing=False)
     asyncio.run(scraper.main_process())
