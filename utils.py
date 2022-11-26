@@ -111,7 +111,7 @@ def __main__():
     print('getting metadata')
     create_metadata_collections()
     print('creating lodestone collection')
-    create_lodestone_collection(5000)
+    create_lodestone_collection(100000)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,1 @@
+The goal of this repo is to create a Final Fantasy XIV lodestone scrapper and a FFlogs scrapper too. Then create some sort of website to see insights of endgame statistics.

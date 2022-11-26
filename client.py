@@ -7,22 +7,18 @@ import sys
 
 from bs4 import BeautifulSoup
 from pymongo import MongoClient, UpdateOne
-from pprint import pprint
+
 
 character_index_api = 'http://127.0.0.1:8000/scraping/lodestone/{}'
 fflogs_index_api = 'http://127.0.0.1:8000/scraping/fflogs/{}'
 
 
 class Client:
-    def __init__(self, chunk_len=13, testing=False):
+    def __init__(self, chunk_len=13, fflogs=False, testing=False):
         self.testing = testing
         self.mongo_client = MongoClient(utils.MONGO_SERVER)
         self.db = self.mongo_client[utils.DATABASE]
         self.raids = self.db[utils.endgame_metadata].find_one({"raids": {"$exists": True}})['raids']
-        m_filter = {
-            '$and': [{'regions': {'$exists': True}},
-                     {'slug': {'$in': ['NA', 'EU', 'JP', 'OC']}}]
-        }
         self.worlds = self.db[utils.endgame_metadata].find_one({'regions': {'$exists': True}})['regions']
         self.worlds = {key: value for key, value in self.worlds.items() if value['slug'] in ['EU', 'NA', 'JP', 'OC']}
         normalization = {}
@@ -39,6 +35,7 @@ class Client:
         self.update_op_list = []
         self.lock = asyncio.Lock()
         tmp = utils.get_fflogs_token()
+        self.scrap_fflogs = fflogs
         self.token_points = True
         self.fflogs_token = tmp['access_token']
         self.time_to_new_token = datetime.datetime.now()+datetime.timedelta(seconds=tmp['expires_in'])
@@ -62,7 +59,7 @@ class Client:
                 for tmp in utils.split(indexes_to_scrap, self.chunk_len):
                     tasks = [asyncio.create_task(self.scrap_character(lodestone_session, _)) for _ in tmp]
 
-                if self.token_points:
+                if self.scrap_fflogs and self.token_points:
                     async with fflogs_session.get(fflogs_index_api.format(self.chunk_len)) as response:
                         data = await response.json()
                         tasks += [asyncio.create_task(self.get_fflogs_info(session=fflogs_session, fflogs_id=_))
@@ -144,7 +141,7 @@ class Client:
         return tmp
 
     async def get_fflogs_info(self, session: aiohttp.ClientSession, fflogs_id=None, character_data=None):
-        # todo: rewrite the query since it's very costly, approach to frozen logs
+        # todo: rewrite the query since it's very costly, approach frozen logs first
         character_filter = f'id: {fflogs_id}' if fflogs_id else \
             f'name: "{character_data["name"]}" serverSlug: "{character_data["server"]}" ' +\
             f'serverRegion: "{character_data["region"]}"'
@@ -175,5 +172,5 @@ class Client:
 
 # a quick test
 if __name__ == '__main__':
-    scraper = Client(chunk_len=3, testing=False)
+    scraper = Client(chunk_len=10, fflogs=False, testing=False)
     asyncio.run(scraper.main_process())
