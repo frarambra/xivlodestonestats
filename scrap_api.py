@@ -1,7 +1,8 @@
-import datetime
-
+import asyncio
+from datetime import datetime, timedelta
 from fastapi import FastAPI
-from utils import DATABASE, MONGO_SERVER, character_collection, endgame_metadata, fflogs_vars
+from utils import DATABASE, MONGO_SERVER, character_collection
+from fflogs_utils import fflogs_vars
 from pymongo import MongoClient
 
 app = FastAPI()
@@ -9,21 +10,33 @@ app = FastAPI()
 # Common variables for the API
 mongo_client = MongoClient(MONGO_SERVER)
 db = mongo_client[DATABASE]
+borrowed_indexes = {}
+indexes_lock = asyncio.Lock()
 
 
 @app.get("/scraping/lodestone/{n_indexes}")
 async def lodestone(n_indexes: int):
     """Returns the amount request of lodestone id to scrap"""
-    m_filter = {
-        "$and": [
-            {"$or": [{"exists": "S"}, {"exists": None}]},
-            {
-                "$or": [{"scrapped_lodestone_date": None},
-                        {"scrapped_lodestone_date": {"$lt": datetime.datetime.now() - datetime.timedelta(days=3)}}
-                ]
-            }
-        ]
-    }
+    n_indexes = min(n_indexes, 100)
+    # Freeing the locked indexes
+    async with indexes_lock:
+        for lodestone_id, expire_time in borrowed_indexes.items():
+            if expire_time > datetime.now():
+                del borrowed_indexes[lodestone_id]
+        m_filter = {
+            "$and": [
+                {"$or": [{"exists": "S"}, {"exists": None}]},
+                {
+                    "$or": [
+                        {"scrapped_lodestone_date": None},
+                        {"scrapped_lodestone_date": {"$lt": datetime.now() - timedelta(days=3)}}
+                    ]
+                },
+                {"_id": {"$nin": list(borrowed_indexes.keys())}}
+            ]
+        }
+        print(f'Borrowed indexes {borrowed_indexes.keys()}')
+
     cursor = db[character_collection].find(m_filter, ['_id'], limit=n_indexes)
     indexes = [item['_id'] for item in cursor]
     if not indexes:
@@ -34,7 +47,6 @@ async def lodestone(n_indexes: int):
         db[character_collection].insert_many(indexes)
         indexes = [_['_id'] for _ in indexes][:n_indexes]
     print(f'sending: {indexes}')
-
     return {'lodestone_indexes': indexes}
 
 
@@ -49,7 +61,7 @@ async def fflogs(n_indexes: int):
         {"exists": "S"},
         {"$or": [
             {"scrapped_fflogs_date": None},
-            {"scrapped_fflogs_date": {"$lt": datetime.datetime.now() - datetime.timedelta(days=3)}}]}
+            {"scrapped_fflogs_date": {"$lt": datetime.now() - timedelta(days=3)}}]}
         ]
     }
 
@@ -64,4 +76,3 @@ async def fflogs(n_indexes: int):
             tmp = {'name': item['name'], 'server': item['server'], 'region': item['region']}
             response['character_data'].append(tmp)
     return response
-
