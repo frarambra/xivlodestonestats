@@ -38,6 +38,17 @@ fflogs_basic_query = '''{{
 }}
 '''
 
+fflogs_current_tier = '''{{
+    characterData {{
+        character({}) {{
+            lodestoneID {} zoneRankings
+        }}
+    }}
+}}
+'''
+
+
+
 points_info_query = '''{
     rateLimitData{ limitPerHour, pointsSpentThisHour, pointsResetIn}
 }'''

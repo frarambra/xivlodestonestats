@@ -65,7 +65,7 @@ class LodestoneScraper:
                     await asyncio.sleep(self.delay)
                     delay_flag = False
 
-        except Exception as e:
+        except Exception:
             print(traceback.format_exc(), file=sys.stderr)
         finally:
             await self.session.close()
@@ -126,7 +126,7 @@ class FFlogsScraper:
     """This class scraps FFlogs.com then dumps it into a mongodb collection."""
     # TODO: Rewrite queries using gql
     def __init__(self, session, batch_size=10, mode='simple'):
-        self.wait_more_points = None
+        self.wait_more_points = False
         self.token_points = None
         self.time_til_points = None
         self.token_points_left = None
@@ -144,9 +144,11 @@ class FFlogsScraper:
         self.err_lock, self.lock = asyncio.Lock(), asyncio.Lock()
         self.mongo_operations = []
 
-        # todo: write other queries for other modes
         self.mode = mode
-        self.query = fflogs_utils.fflogs_basic_query
+        if mode == 'simple':
+            self.query = fflogs_utils.fflogs_basic_query
+        elif mode == 'current_tier':
+            self.query = fflogs_utils.fflogs_current_tier
 
     def refresh_token(self):
         tmp = fflogs_utils.get_fflogs_token()
@@ -156,7 +158,6 @@ class FFlogsScraper:
     def refresh_points(self):
         res = self.fflogs_query(fflogs_utils.points_info_query)
         res = res['data']['rateLimitData']
-        self.wait_more_points = False
         self.token_points = res['limitPerHour']
         self.token_points_left = self.token_points - res['pointsSpentThisHour']
         self.time_til_points = datetime.now() + timedelta(seconds=res['pointsResetIn'])
@@ -164,42 +165,83 @@ class FFlogsScraper:
     async def scrap(self):
         # Should the API tell clients to stop when there's no information
         # to request from fflogs?
+        # Check if there's a way to have a clean logic on query and responses execution
         while True:
             if self.time_to_new_token > datetime.now():
                 self.refresh_token()
 
             while self.wait_more_points:
                 if self.time_til_points > datetime.now():
+                    self.wait_more_points = False
                     self.refresh_points()
 
+            response = requests.get(fflogs_index_api.format(self.batch_size), verify=False)
+            data = response.json()
+            filters_to_apply = []
+
+            for fflogs_id in data['fflogs_id']:
+                filters_to_apply.append(f'id: {fflogs_id}')
+            for character in data['character_data']:
+                chara_filter = f'name: "{character["name"]}" serverSlug: "{character["server"]}" ' + \
+                               f'serverRegion: "{character["region"]}"'
+                filters_to_apply.append(chara_filter)
+
             if self.mode == 'simple':
-                response = requests.get(fflogs_index_api.format(self.batch_size), verify=False)
-                data = response.json()
-
-                filters_to_apply = []
-                for fflogs_id in data['fflogs_id']:
-                    filters_to_apply.append(f'id: {fflogs_id}')
-                for character in data['character_data']:
-                    chara_filter = f'name: "{character["name"]}" serverSlug: "{character["server"]}" ' + \
-                                   f'serverRegion: "{character["region"]}"'
-                    filters_to_apply.append(chara_filter)
-
                 tasks = [asyncio.create_task(self.aio_fflogs_query(self.query.format(_)))
                          for _ in filters_to_apply]
                 for response in await asyncio.gather(*tasks):
                     if 'status' in response.keys() and response['status'] == 429:
                         self.wait_more_points = True
                     else:
-                        response = response['data']['characterData']['character']
-                        response['_id'], response['fflogs_id'] = response['lodestoneID'], response['canonicalID']
-                        response['scrapped_fflogs_date'] = datetime.now()
-                        del response['lodestoneID']
-                        del response['canonicalID']
+                        response = self.clean_success_response(response)
                         update = UpdateOne({"_id": response["_id"]}, {"$set": response}, upsert=True)
                         self.mongo_operations.append(update)
 
+            elif self.mode == 'current_tier':
+                tasks = []
+                for character_filter in filters_to_apply:
+                    extra_fields = '' if 'id' in character_filter else 'canonicalID hidden'
+                    query = self.query.format(character_filter, extra_fields)
+                    task = asyncio.create_task(self.aio_fflogs_query(query))
+                    tasks.append(task)
+                    break
+                for response in await asyncio.gather(*tasks):
+                    if 'status' in response.keys() and response['status'] == 429:
+                        self.wait_more_points = True
+                    else:
+                        response = self.clean_success_response(response)
+                        response = {
+                            '_id': response['_id'], 'scrapped_fflogs_date': response['scrapped_fflogs_date'],
+                            'difficulty': response['zoneRankings']['difficulty'],
+                            'zone': response['zoneRankings']['zone'],
+                            'rankings': [
+                                {
+                                    str(boss['encounter']['id']): boss['encounter']['name'],
+                                    'best_percent': boss['rankPercent'],
+                                    'median_percent': boss['medianPercent'],
+                                    'total_kills': boss['totalKills'],
+                                    'best_job': boss['spec']
+                                } for boss in response['zoneRankings']['rankings']
+                            ]
+                        }
+                        update = UpdateOne({"_id": response["_id"]}, {"$set": response}, upsert=True)
+                        self.mongo_operations.append(update)
+
+            if self.mongo_operations:
                 self.db[utils.character_collection].bulk_write(self.mongo_operations)
                 self.mongo_operations = []
+
+    @staticmethod
+    def clean_success_response(response):
+        response = response['data']['characterData']['character']
+        response['_id'] = response['lodestoneID']
+        del response['lodestoneID']
+        if 'canonicalID' in response.keys():
+            response['fflogs_id'] = response['canonicalID']
+            del response['canonicalID']
+        response['scrapped_fflogs_date'] = datetime.now()
+
+        return response
 
     async def aio_fflogs_query(self, query: str) -> dict:
         headers = {'Content-Type': "application/json", 'Authorization': f'Bearer {self.fflogs_token}'}
@@ -218,7 +260,7 @@ class FFlogsScraper:
 async def main():
     async with aiohttp.ClientSession() as session:
         # scraper = LodestoneScraper(session=session, batch_size=10, delay=3)
-        # scraper = FFlogsScraper(session, batch_size=3)
+        # scraper = FFlogsScraper(session, batch_size=3, mode='current_tier')
         # await scraper.scrap()
         pass
 

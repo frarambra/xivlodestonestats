@@ -2,7 +2,6 @@ import asyncio
 from datetime import datetime, timedelta
 from fastapi import FastAPI
 from utils import DATABASE, MONGO_SERVER, character_collection
-from fflogs_utils import fflogs_vars
 from pymongo import MongoClient
 
 app = FastAPI()
