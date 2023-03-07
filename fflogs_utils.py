@@ -1,16 +1,15 @@
 import requests
-import json
+import utils
+import os
 from pymongo import MongoClient
 
-with open('config/mongo_conn.json') as f_read:
-    conn_vars = json.load(f_read)
-    MONGO_SERVER = conn_vars["MONGO_SERVER"]
-    DATABASE = conn_vars["DATABASE"]
-    character_collection = conn_vars["character_colletion"]
-    endgame_metadata = conn_vars["endgame_metadata"]
 
-with open('config/client_params.json') as f_read:
-    fflogs_vars = json.load(f_read)
+# FFLogs related "constants"
+CLIENT_ID = os.getenv("FFLOGS_CLIENT_ID")
+CLIENT_SECRET = os.getenv("FFLOGS_CLIENT_SECRET")
+AUTH_URL = "https://www.fflogs.com/oauth/authorize"
+TOKEN_URL = "https://www.fflogs.com/oauth/token"
+API_URL = "https://www.fflogs.com/api/v2/client"
 
 zone_query = '''{
     worldData{
@@ -47,7 +46,15 @@ fflogs_current_tier = '''{{
 }}
 '''
 
-
+fflogs_old_tiers = '''{{
+    characterData {{
+        character({}) {{
+            lodestoneID {}
+            {}
+        }}
+    }}
+}}
+'''
 
 points_info_query = '''{
     rateLimitData{ limitPerHour, pointsSpentThisHour, pointsResetIn}
@@ -55,19 +62,19 @@ points_info_query = '''{
 
 
 def get_fflogs_token():
-    token_res = requests.post(fflogs_vars['token_url'], data={'grant_type': 'client_credentials'},
+    token_res = requests.post(TOKEN_URL, data={'grant_type': 'client_credentials'},
                               verify=False, allow_redirects=False,
-                              auth=(fflogs_vars['client_id'], fflogs_vars['client_secret']))
+                              auth=(CLIENT_ID, CLIENT_SECRET))
     return token_res.json()
 
 
 def create_metadata_collections():
-    mongo_client = MongoClient(MONGO_SERVER)
-    db = mongo_client[DATABASE]
+    mongo_client = MongoClient(utils.MONGO_URI)
+    db = mongo_client[utils.DATABASE]
     # generate data regarding raid zones from fflogs API
     tokens = get_fflogs_token()
     headers = {'Content-Type': "application/json", 'Authorization': 'Bearer ' + tokens['access_token']}
-    fflogs_res = requests.post(fflogs_vars['api_url'], headers=headers, json={'query': zone_query})
+    fflogs_res = requests.post(API_URL, headers=headers, json={'query': zone_query})
     api_data = fflogs_res.json()
     expansion_data = api_data['data']['worldData']['expansions']
 
@@ -92,7 +99,7 @@ def create_metadata_collections():
 
     adapted_api_data = {'worldData': {'expansions': tmp}}
 
-    fflogs_res = requests.post(fflogs_vars['api_url'], headers=headers, json={'query': world_query})
+    fflogs_res = requests.post(API_URL, headers=headers, json={'query': world_query})
     api_data = fflogs_res.json()
     region_data = api_data['data']['worldData']['regions']
     # pprint(region_data)

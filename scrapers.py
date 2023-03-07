@@ -18,10 +18,10 @@ class LodestoneScraper:
     def __init__(self, session, batch_size=10, delay=2):
         self.session = session
         self.delay = delay
-        self.mongo_client = MongoClient(utils.MONGO_SERVER)
+        self.mongo_client = MongoClient(utils.MONGO_URI)
         self.db = self.mongo_client[utils.DATABASE]
-        self.raids = self.db[utils.endgame_metadata].find_one({"raids": {"$exists": True}})['raids']
-        self.worlds = self.db[utils.endgame_metadata].find_one({'regions': {'$exists': True}})['regions']
+        self.raids = self.db[utils.ENDGAME_METADATA].find_one({"raids": {"$exists": True}})['raids']
+        self.worlds = self.db[utils.ENDGAME_METADATA].find_one({'regions': {'$exists': True}})['regions']
         self.worlds = {key: value for key, value in self.worlds.items() if value['slug'] in ['EU', 'NA', 'JP', 'OC']}
         normalization = {}
         self.regions = {}
@@ -58,7 +58,7 @@ class LodestoneScraper:
                             self.update_op_list.append(update)
 
                 if self.update_op_list:
-                    self.db[utils.character_collection].bulk_write(self.update_op_list)
+                    self.db[utils.CHARACTER_COLLECTION].bulk_write(self.update_op_list)
                     self.update_op_list = []
 
                 if delay_flag:
@@ -125,7 +125,7 @@ class LodestoneScraper:
 class FFlogsScraper:
     """This class scraps FFlogs.com then dumps it into a mongodb collection."""
     # TODO: Rewrite queries using gql
-    def __init__(self, session, batch_size=10, mode='simple'):
+    def __init__(self, session, batch_size=10, mode='simple', **kwargs):
         self.wait_more_points = False
         self.token_points = None
         self.time_til_points = None
@@ -137,9 +137,9 @@ class FFlogsScraper:
         self.refresh_points()
 
         self.batch_size = batch_size
-        self.mongo_client = MongoClient(utils.MONGO_SERVER)
+        self.mongo_client = MongoClient(utils.MONGO_URI)
         self.db = self.mongo_client[utils.DATABASE]
-        self.raids = self.db[utils.endgame_metadata].find_one({"raids": {"$exists": True}})['raids']
+        self.raids = self.db[utils.ENDGAME_METADATA].find_one({"raids": {"$exists": True}})['raids']
 
         self.err_lock, self.lock = asyncio.Lock(), asyncio.Lock()
         self.mongo_operations = []
@@ -148,6 +148,9 @@ class FFlogsScraper:
         if mode == 'simple':
             self.query = fflogs_utils.fflogs_basic_query
         elif mode == 'current_tier':
+            self.query = fflogs_utils.fflogs_current_tier
+        elif mode == 'old_fights':
+            self.tiers = ' '.join([f'e_{x}' for x in kwargs['fights_id']])
             self.query = fflogs_utils.fflogs_current_tier
 
     def refresh_token(self):
@@ -186,6 +189,7 @@ class FFlogsScraper:
                                f'serverRegion: "{character["region"]}"'
                 filters_to_apply.append(chara_filter)
 
+            tasks = []
             if self.mode == 'simple':
                 tasks = [asyncio.create_task(self.aio_fflogs_query(self.query.format(_)))
                          for _ in filters_to_apply]
@@ -198,13 +202,12 @@ class FFlogsScraper:
                         self.mongo_operations.append(update)
 
             elif self.mode == 'current_tier':
-                tasks = []
                 for character_filter in filters_to_apply:
                     extra_fields = '' if 'id' in character_filter else 'canonicalID hidden'
                     query = self.query.format(character_filter, extra_fields)
                     task = asyncio.create_task(self.aio_fflogs_query(query))
                     tasks.append(task)
-                    break
+
                 for response in await asyncio.gather(*tasks):
                     if 'status' in response.keys() and response['status'] == 429:
                         self.wait_more_points = True
@@ -227,8 +230,15 @@ class FFlogsScraper:
                         update = UpdateOne({"_id": response["_id"]}, {"$set": response}, upsert=True)
                         self.mongo_operations.append(update)
 
+            elif self.mode == 'old_fights':
+                for character_filter in filters_to_apply:
+                    extra_fields = '' if 'id' in character_filter else 'canonicalID hidden'
+                    query = self.query.format(character_filter, extra_fields, self.tiers)
+                    task = asyncio.create_task(self.aio_fflogs_query(query))
+                    tasks.append(task)
+
             if self.mongo_operations:
-                self.db[utils.character_collection].bulk_write(self.mongo_operations)
+                self.db[utils.CHARACTER_COLLECTION].bulk_write(self.mongo_operations)
                 self.mongo_operations = []
 
     @staticmethod
@@ -246,14 +256,14 @@ class FFlogsScraper:
     async def aio_fflogs_query(self, query: str) -> dict:
         headers = {'Content-Type': "application/json", 'Authorization': f'Bearer {self.fflogs_token}'}
         payload = {'query': query}
-        async with self.session.post(fflogs_utils.fflogs_vars['api_url'], headers=headers, json=payload) as response:
+        async with self.session.post(fflogs_utils.API_URL, headers=headers, json=payload) as response:
             response_data = await response.json()
             return response_data
 
     def fflogs_query(self, query: str) -> dict:
         headers = {'Content-Type': "application/json", 'Authorization': f'Bearer {self.fflogs_token}'}
         payload = {'query': query}
-        fflogs_res = requests.post(fflogs_utils.fflogs_vars['api_url'], headers=headers, json=payload)
+        fflogs_res = requests.post(fflogs_utils.API_URL, headers=headers, json=payload)
         return fflogs_res.json()
 
 
